@@ -5,8 +5,6 @@ build/
 
 # STM32CubeIDE / Eclipse
 .settings/
-.cproject
-.project
 *.launch
 
 # CubeIDE
