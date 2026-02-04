@@ -1,0 +1,21 @@
+# Build
+Debug/
+Release/
+build/
+
+# STM32CubeIDE / Eclipse
+.settings/
+.cproject
+.project
+*.launch
+
+# CubeIDE
+STM32CubeIDE/
+
+# Backup i śmieci
+*.bak
+*.tmp
+*.swp
+
+# System
+.DS_Store
