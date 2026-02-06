@@ -6,21 +6,25 @@
  */
 #include "stm32f3xx_hal.h"
 
+#include "main.h"
 #include "frame_handler.h"
 #include "lux_service.h"
 #include "lux_buffer.h"
+#include "protocol.h"
+#include "crc.h"
 
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
-
-#define DEVICE 'p'
 
 /* Bufor globalny z pomiarami */
 extern LuxBuffer_t luxBuffer;
 
 /* UART do odpowiedzi */
 extern UART_HandleTypeDef huart2;
+
+extern uint32_t frequency;
+
 
 /* Maksymalna długość obsługiwanej ramki */
 #define FRAME_MAX_LEN 64
@@ -33,89 +37,127 @@ uint8_t error_code;
 
 void Frame_Handle(const Frame_t *frame) // koordynator
 {
-	Frame_Validation(&frame);
+	Frame_Validation(frame);
 }
 
 void Frame_Validation(const Frame_t *frame)
 {
-    switch (frame->status)
-    {
-        case FRAME_OK:
-            Handle_Ping();
-            break;
+	if (frame->status != FRAME_OK) {
+    	Send_Error(frame, frame->status);
+	}
 
-        case FRAME_ERR_LEN:
-        	Send_Error(&frame, FRAME_ERR_LEN);
-            break;
+	if (frame->receiver != DEVICE) {
+    	Send_Error(frame, FRAME_ERR_ADD);
+	}
 
-        case FRAME_ERR_CRC:
-        	Send_Error(&frame ,FRAME_ERR_CRC);
-            break;
-    }
+	FrameHandler_Process(frame);
+	return;
 }
 
-static uint8_t calc_crc(const uint8_t *buf, uint16_t len)
+void Send_Error(const Frame_t *frame, frame_status_t error_code)
 {
-    uint8_t crc = 0;
-
-    for (uint16_t i = 0; i < len; i++) {
-        crc += buf[i];
-    }
-
-    return crc;
-}
-
-void Send_Error(const Frame_t *frame, error_code)
-{
-    uint8_t tx_buf[7];
+    uint8_t tx_buf[9];
     uint16_t idx = 0;
+    const uint8_t payload_len = 2;
 
-    /* === SKŁADANIE RAMKI === */
+    /* === SKLADANIE RAMKI === */
 
-    tx_buf[idx++] = ';';     		 // znak startu
-    tx_buf[idx++] = DEVICE;     	 // kod urządzenia nadawcy
-    tx_buf[idx++] = frame->sender;   // kod urządzenia odbiorcy
-    tx_buf[idx++] = 2;               // długość
-    tx_buf[idx++] = CMD_NACK;        // komenda: ERROR
-    tx_buf[idx++] = (uint8_t)error_code;    // kod błędu
+    tx_buf[idx++] = ':';             // znak startu
+    tx_buf[idx++] = DEVICE;          // kod urzadzenia nadawcy
+    tx_buf[idx++] = (uint8_t)frame->sender;   // kod urzadzenia odbiorcy
+    tx_buf[idx++] = (uint8_t)('0' + payload_len); // dlugosc
+    tx_buf[idx++] = 'N';//(uint8_t)CMD_NACK;        // komenda: NAK
+    tx_buf[idx++] = (uint8_t)('0' + error_code);      // kod bledu
 
-    /* === CRC === */
-    tx_buf[idx++] = calc_crc(tx_buf, idx);
+    /* === CRC (3 cyfry ASCII) === */
+    {
+        uint8_t crc = calc_crc(tx_buf, idx);
+        tx_buf[idx++] = (uint8_t)('0' + (crc / 100));
+        tx_buf[idx++] = (uint8_t)('0' + ((crc / 10) % 10));
+        tx_buf[idx++] = (uint8_t)('0' + (crc % 10));
+    }
 
-    /* === WYSYŁANIE === */
-    HAL_UART_Transmit(&huart2, &tx_buf, 7, HAL_MAX_DELAY);
+    /* === WYSYLANIE === */
+    USART_SendBuffer(tx_buf, idx);
 }
 
-void Send_Response();
+void Send_Response(const Frame_t *frame) {
+    uint8_t tx_buf[9];
+    uint16_t idx = 0;
+    const uint8_t payload_len = 1;
 
-void FrameHandler_Process(uint8_t *data, uint16_t length)
+    /* === SKLADANIE RAMKI === */
+
+    tx_buf[idx++] = ':';             // znak startu
+    tx_buf[idx++] = DEVICE;          // kod urzadzenia nadawcy
+    tx_buf[idx++] = (uint8_t)frame->sender;   // kod urzadzenia odbiorcy
+    tx_buf[idx++] = (uint8_t)('0' + payload_len); // dlugosc
+    tx_buf[idx++] = 'A';//(uint8_t)CMD_NACK;        // komenda: NAK
+    /* === CRC (3 cyfry ASCII) === */
+    {
+        uint8_t crc = calc_crc(tx_buf, idx);
+        tx_buf[idx++] = (uint8_t)('0' + (crc / 100));
+        tx_buf[idx++] = (uint8_t)('0' + ((crc / 10) % 10));
+        tx_buf[idx++] = (uint8_t)('0' + (crc % 10));
+    }
+
+    /* === WYSYLANIE === */
+    USART_SendBuffer(tx_buf, idx);
+}
+
+void Handle_Ping(const Frame_t *frame) {
+    uint8_t tx_buf[9];
+    uint16_t idx = 0;
+    const uint8_t payload_len = 2;
+
+    /* === SKLADANIE RAMKI === */
+
+    tx_buf[idx++] = ':';             // znak startu
+    tx_buf[idx++] = DEVICE;          // kod urzadzenia nadawcy
+    tx_buf[idx++] = (uint8_t)frame->sender;   // kod urzadzenia odbiorcy
+    tx_buf[idx++] = (uint8_t)('0' + payload_len); // dlugosc
+    tx_buf[idx++] = 'A';//(uint8_t)CMD_NACK;        // komenda: NAK
+    /* === CRC (3 cyfry ASCII) === */
+    {
+        uint8_t crc = calc_crc(tx_buf, idx);
+        tx_buf[idx++] = (uint8_t)('0' + (crc / 100));
+        tx_buf[idx++] = (uint8_t)('0' + ((crc / 10) % 10));
+        tx_buf[idx++] = (uint8_t)('0' + (crc % 10));
+    }
+
+    /* === WYSYLANIE === */
+    USART_SendBuffer(tx_buf, idx);
+	return;
+}
+
+void FrameHandler_Process(const Frame_t *frame)
 {
     char cmd[FRAME_MAX_LEN];
 
     /* Ochrona przed zbyt długą ramką */
-    if (length == 0 || length >= FRAME_MAX_LEN)
+    if (frame->length == 0 || frame->length >= FRAME_MAX_LEN)
     {
         return;
     }
 
     /* Skopiowanie danych do bufora roboczego
        + dopisanie znaku końca stringa */
-    memcpy(cmd, data, length);
-    cmd[length] = '\0';
+    memcpy(cmd, frame->data, frame->length);
+    cmd[frame->length] = '\0';
 
     /* ===== KOMENDA: LAST ===== */
     if (strcmp(cmd, "GETLAST") == 0)
     {
         /* Wywołanie logiki aplikacji */
-        LuxService_PrintLastN(1);
+        LuxService_ReturnLastN(1, frame->sender);
         return;
     }
 
     /* ===== KOMENDA: GET N ===== */
-    if (strncmp(cmd, "GETALL", 3) == 0)
+    if (strcmp(cmd, "GETALL") == 0)
     {
         /* Wywołanie logiki aplikacji */
-        LuxService_PrintLastN(LUX_BUFFER_SIZE); // moge tak zrobic bo jest ogranicznik
+        LuxService_ReturnLastN(LUX_BUFFER_SIZE, frame->sender); // moge tak zrobic bo jest ogranicznik
         return;
     }
 
@@ -126,37 +168,28 @@ void FrameHandler_Process(uint8_t *data, uint16_t length)
         uint16_t n = (uint16_t)atoi(&cmd[3]);
 
         /* Wywołanie logiki aplikacji */
-        LuxService_PrintLastN(n);
+        LuxService_ReturnLastN(n, frame->sender);
         return;
     }
 
-    /* ===== KOMENDA: COUNT ===== */
-    if (strcmp(cmd, "COUNT") == 0)
+    if (strncmp(cmd, "SETTM", 5) == 0)
     {
-        char buf[32];
+        uint32_t ms = (uint32_t)atoi(&cmd[5]);
+        if (ms == 0) {
+        	Send_Error(frame, FRAME_ERR_TIM);
+        	return;
+        }
+        // ustawienie globalnej zmiennej z freertos.c
+        extern uint32_t frequency;
+        frequency = ms;
 
-        uint16_t count = LuxBuffer_Count(&luxBuffer);
+        Send_Response(frame);
 
-        int len = snprintf(buf,
-                           sizeof(buf),
-                           "COUNT: %u\r\n",
-                           count);
-
-        HAL_UART_Transmit(&huart2,
-                          (uint8_t*)buf,
-                          len,
-                          100);
         return;
     }
 
     /* ===== NIEZNANA KOMENDA ===== */
-    {
-        const char *err = "ERR: UNKNOWN CMD\r\n";
-        HAL_UART_Transmit(&huart2,
-                          (uint8_t*)err,
-                          strlen(err),
-                          100);
-    }
+    Send_Error(frame, FRAME_ERR_CMD);
 }
 
 

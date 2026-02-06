@@ -73,3 +73,19 @@ HAL_StatusTypeDef BH1750_ReadLux(I2C_HandleTypeDef *hi2c, float *lux)
 
     return HAL_OK;
 }
+
+HAL_StatusTypeDef BH1750_SendCommand_DMA(I2C_HandleTypeDef *hi2c, uint8_t cmd)
+{
+    return HAL_I2C_Master_Transmit_DMA(hi2c, BH1750_ADDR, &cmd, 1);
+}
+
+HAL_StatusTypeDef BH1750_ReadRaw_DMA(I2C_HandleTypeDef *hi2c, uint8_t *buf, uint16_t len)
+{
+    return HAL_I2C_Master_Receive_DMA(hi2c, BH1750_ADDR, buf, len);
+}
+
+void BH1750_ConvertLux(const uint8_t *buf, float *lux)
+{
+    uint16_t raw = (uint16_t)((buf[0] << 8) | buf[1]);
+    *lux = raw / 1.2f;
+}

@@ -10,12 +10,14 @@
 
 #include <stdint.h>
 
+#include "frame.h"
+
 /* Główna funkcja obsługi ramki
    data   – wskaźnik na dane ramki
    length – długość ramki w bajtach */
 void Frame_Handle(const Frame_t *frame);
 
-void FrameHandler_Process(uint8_t *data, uint16_t length);
+void FrameHandler_Process(const Frame_t *frame);
 
 void Send_Error(const Frame_t *frame, uint8_t error_code);
 

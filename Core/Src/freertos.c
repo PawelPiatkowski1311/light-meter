@@ -27,8 +27,13 @@
 /* USER CODE BEGIN Includes */
 #include <stdio.h> // pawel
 #include <string.h> // pawel
+#include <stdint.h>
+#include <string.h>
+
+#include "frame.h"
 #include "bh1750.h" // pawel
 #include "lux_buffer.h"
+#include "frame_handler.h"
 
 /* USER CODE END Includes */
 
@@ -51,9 +56,6 @@ extern LuxBuffer_t luxBuffer;
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-#include <stdint.h>
-#include <string.h>
-
 void FrameService(uint8_t* ramka, uint8_t dlugosc);
 
 typedef enum {
@@ -63,28 +65,8 @@ typedef enum {
     FSM_WAIT_LEN = 4,
     FSM_WAIT_DATA = 5,
     FSM_WAIT_CRC = 6,
-    FSM_WAIT_STOP = 7,
-	FSM_DONE = 8
 } FSM_State;
 
-#define MAX_DATA_LEN 64
-
-// Statusy
-typedef enum {
-    FRAME_NONE = 0,     // brak ramki
-    FRAME_OK,
-    FRAME_ERR_LEN,
-    FRAME_ERR_CRC
-} frame_status_t;
-
-typedef struct {
-    uint8_t sender;
-    uint8_t receiver;
-    uint8_t length;
-    uint8_t data[MAX_DATA_LEN];
-    uint8_t crc;
-    frame_status_t status;
-} Frame_t;
 
 FSM_State fsm_state = FSM_WAIT_START;
 Frame_t frame;
@@ -97,8 +79,34 @@ uint8_t crc_value = 0;
 uint8_t crc_array[3];
 uint8_t computed_crc = 0;
 
-uint8_t znak;
-char m = '1';
+uint32_t frequency = 1000;
+
+#define I2C_EVT_TX_DONE (1u << 0)
+#define I2C_EVT_RX_DONE (1u << 1)
+#define I2C_EVT_ERR     (1u << 2)
+
+static TaskHandle_t sensorTaskHandle = NULL;
+static uint8_t bh1750_rx_buf[2];
+
+static void I2C_ClearEvents(void)
+{
+    uint32_t dummy = 0;
+    (void)xTaskNotifyWait(0, 0xFFFFFFFFu, &dummy, 0);
+}
+
+static HAL_StatusTypeDef I2C_WaitEvents(uint32_t wait_mask, TickType_t timeout)
+{
+    uint32_t events = 0;
+    if (xTaskNotifyWait(0, wait_mask, &events, timeout) != pdTRUE)
+    {
+        return HAL_TIMEOUT;
+    }
+    if (events & I2C_EVT_ERR)
+    {
+        return HAL_ERROR;
+    }
+    return HAL_OK;
+}
 
 void FSM_ProcessByte(uint8_t rx)
 {
@@ -110,8 +118,6 @@ void FSM_ProcessByte(uint8_t rx)
                 computed_crc = rx; // CRC liczymy od startu
                 data_index = 0;
                 crc_index = 0;
-                m = '1';
-                HAL_UART_Transmit(&huart2, &m, 1, HAL_MAX_DELAY);
             }
             break;
 
@@ -119,23 +125,20 @@ void FSM_ProcessByte(uint8_t rx)
             frame.sender = rx;
             computed_crc += rx;
             fsm_state = FSM_WAIT_RECEIVER;
-            m = '2';
-            HAL_UART_Transmit(&huart2, &m, 1, HAL_MAX_DELAY);
             break;
 
         case FSM_WAIT_RECEIVER:
 			frame.receiver = rx;
 			computed_crc += rx;
 			fsm_state = FSM_WAIT_LEN;
-			m = '3';
-			HAL_UART_Transmit(&huart2, &m, 1, HAL_MAX_DELAY);
             break;
 
         case FSM_WAIT_LEN:
         	if (!(rx >= '0' && rx <= '9'))
         	{
         		frame.status = FRAME_ERR_LEN;
-        		fsm_state = FSM_DONE;
+        		fsm_state = FSM_WAIT_START;
+			    frame_ready  = 1;   // tylko sygnał
         		break;
         	}
 			value = rx - '0';   // konwersja z ascii na wartość liczbową
@@ -150,8 +153,6 @@ void FSM_ProcessByte(uint8_t rx)
 			computed_crc += rx;
 			data_index = 0;
 			fsm_state = (frame.length > 0) ? FSM_WAIT_DATA : FSM_WAIT_CRC;
-			m = '4';
-			HAL_UART_Transmit(&huart2, &m, 1, HAL_MAX_DELAY);
             break;
 
         case FSM_WAIT_DATA:
@@ -159,8 +160,6 @@ void FSM_ProcessByte(uint8_t rx)
             computed_crc += rx;
             if(data_index >= frame.length)
                 fsm_state = FSM_WAIT_CRC;
-            m = '5';
-            HAL_UART_Transmit(&huart2, &m, 1, HAL_MAX_DELAY);
             break;
 
         case FSM_WAIT_CRC:
@@ -181,6 +180,7 @@ void FSM_ProcessByte(uint8_t rx)
 				// błąd CRC -> reset
 			    frame.status = FRAME_ERR_CRC;
 			    fsm_state = FSM_WAIT_START;
+			    frame_ready  = 1;   // tylko sygnał
 			}
             break;
     }
@@ -218,7 +218,7 @@ const osThreadAttr_t SensorTask_attributes = {
 };
 /* Definitions for FrameTask */
 osThreadId_t FrameTaskHandle;
-uint32_t FrameTaskBuffer[ 128 ];
+uint32_t FrameTaskBuffer[ 512 ]; // zwiekszone
 osStaticThreadDef_t FrameTaskControlBlock;
 const osThreadAttr_t FrameTask_attributes = {
   .name = "FrameTask",
@@ -381,29 +381,50 @@ void StartSensorTask(void *argument)
   /* Infinite loop */
 	char uart_buf[64]; // pawel
 	uint16_t lux_x10;
-	uint16_t frequency = 1000;
 	float lux; // pawel
 	char ch;
 
+	TickType_t last_wake = xTaskGetTickCount();
+
 	LuxBuffer_Init(&luxBuffer);
+    sensorTaskHandle = xTaskGetCurrentTaskHandle();
 
     vTaskDelay(pdMS_TO_TICKS(200));
 
     /* INIT BH1750 */
-    BH1750_Init(&hi2c1);
+    I2C_ClearEvents();
+    if (BH1750_SendCommand_DMA(&hi2c1, BH1750_POWER_ON) == HAL_OK)
+    {
+        (void)I2C_WaitEvents(I2C_EVT_TX_DONE | I2C_EVT_ERR, pdMS_TO_TICKS(100));
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    I2C_ClearEvents();
+    if (BH1750_SendCommand_DMA(&hi2c1, BH1750_RESET) == HAL_OK)
+    {
+        (void)I2C_WaitEvents(I2C_EVT_TX_DONE | I2C_EVT_ERR, pdMS_TO_TICKS(100));
+    }
 
     vTaskDelay(pdMS_TO_TICKS(10));
 
     /* start pomiaru */
-    BH1750_StartContHR(&hi2c1);
+    I2C_ClearEvents();
+    if (BH1750_SendCommand_DMA(&hi2c1, BH1750_CONT_H_RES) == HAL_OK)
+    {
+        (void)I2C_WaitEvents(I2C_EVT_TX_DONE | I2C_EVT_ERR, pdMS_TO_TICKS(100));
+    }
 
     /* CZEKAJ NA PIERWSZY POMIAR (najważniejsze!) */
     vTaskDelay(pdMS_TO_TICKS(180));
 
   for(;;)
   {
-      if (BH1750_ReadLux(&hi2c1, &lux) == HAL_OK)
+      I2C_ClearEvents();
+      if (BH1750_ReadRaw_DMA(&hi2c1, bh1750_rx_buf, sizeof(bh1750_rx_buf)) == HAL_OK &&
+          I2C_WaitEvents(I2C_EVT_RX_DONE | I2C_EVT_ERR, pdMS_TO_TICKS(200)) == HAL_OK)
       {
+          BH1750_ConvertLux(bh1750_rx_buf, &lux);
           /* Konwersja float -> int (lux * 10) */
           lux_x10 = (uint16_t)(lux * 10.0f);
 
@@ -412,23 +433,19 @@ void StartSensorTask(void *argument)
 
           LuxBuffer_Get(&luxBuffer, 1, &lux); /// nadpisuje obecny pomiar
 
+          /*
     	  int len = snprintf(uart_buf, sizeof(uart_buf), "Lux: %d\r\n", lux_x10);
 		  	  // ----- dane z pomiaru ------ //
 		  	for (int i = 0; i < len; i++)
 		  	{
 		  	    ch = uart_buf[i];
-		  	    HAL_UART_Transmit(&huart2, (uint8_t*)&ch, 1, HAL_MAX_DELAY);
+		  	    USART_SendBuffer((uint8_t*)&ch, 1);
 		  	}
-
-    	      //HAL_UART_Transmit(&huart2, (uint8_t*)uart_buf, 1, HAL_MAX_DELAY);
+		  	*/
       }
 
       //vTaskDelay(pdMS_TO_TICKS(500));
-      for(int i = 0; i <= frequency; i++) {
-          osDelay(1);
-      }
-    //HAL_UART_Transmit(&huart2, &pomiar, 1, HAL_MAX_DELAY);
-    //
+      vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(frequency));
   }
   /* USER CODE END StartSensorTask */
 }
@@ -439,9 +456,6 @@ void StartSensorTask(void *argument)
 * @param argument: Not used
 * @retval None
 */
-void ObslugaRamki(uint8_t* ramka, uint8_t dlugosc){
-	HAL_UART_Transmit(&huart2, '!', 1, HAL_MAX_DELAY);
-}
 /* USER CODE END Header_StartFrameTask */
 void StartFrameTask(void *argument)
 {
@@ -451,7 +465,7 @@ void StartFrameTask(void *argument)
 
 	    // powitanie
 	    char msg[] = "START USART2 Polling\r\n";
-	    HAL_UART_Transmit(&huart2, (uint8_t*)msg, sizeof(msg)-1, HAL_MAX_DELAY);
+	    USART_SendBuffer((uint8_t*)msg, sizeof(msg)-1);
   for(;;)
   {
 	  // odbiór 1 bajtu (blocking)
@@ -465,7 +479,7 @@ void StartFrameTask(void *argument)
           /* Krytyczna sekcja – bardzo krótka */
           taskENTER_CRITICAL();
           frame_ready = 0;
-          frame_t local_frame = frame;   // kopia lokalna
+          Frame_t local_frame = frame;   // kopia lokalna
           taskEXIT_CRITICAL();
 
           /* === ANALIZA RAMKI === */
@@ -486,6 +500,36 @@ void Callback01(void *argument)
 
 /* Private application code --------------------------------------------------*/
 /* USER CODE BEGIN Application */
+
+void HAL_I2C_MasterTxCpltCallback(I2C_HandleTypeDef *hi2c)
+{
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    if (hi2c->Instance == I2C1 && sensorTaskHandle != NULL)
+    {
+        xTaskNotifyFromISR(sensorTaskHandle, I2C_EVT_TX_DONE, eSetBits, &xHigherPriorityTaskWoken);
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    }
+}
+
+void HAL_I2C_MasterRxCpltCallback(I2C_HandleTypeDef *hi2c)
+{
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    if (hi2c->Instance == I2C1 && sensorTaskHandle != NULL)
+    {
+        xTaskNotifyFromISR(sensorTaskHandle, I2C_EVT_RX_DONE, eSetBits, &xHigherPriorityTaskWoken);
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    }
+}
+
+void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c)
+{
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    if (hi2c->Instance == I2C1 && sensorTaskHandle != NULL)
+    {
+        xTaskNotifyFromISR(sensorTaskHandle, I2C_EVT_ERR, eSetBits, &xHigherPriorityTaskWoken);
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    }
+}
 
 /* USER CODE END Application */
 

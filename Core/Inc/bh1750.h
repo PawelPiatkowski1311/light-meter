@@ -31,4 +31,9 @@ HAL_StatusTypeDef BH1750_StartContHR(I2C_HandleTypeDef *hi2c); /// !?!?!?
 /* Odczyt natężenia światła w lux */
 HAL_StatusTypeDef BH1750_ReadLux(I2C_HandleTypeDef *hi2c, float *lux);
 
+/* Wersje nieblokujace z DMA */
+HAL_StatusTypeDef BH1750_SendCommand_DMA(I2C_HandleTypeDef *hi2c, uint8_t cmd);
+HAL_StatusTypeDef BH1750_ReadRaw_DMA(I2C_HandleTypeDef *hi2c, uint8_t *buf, uint16_t len);
+void BH1750_ConvertLux(const uint8_t *buf, float *lux);
+
 #endif /* INC_BH1750_H_ */

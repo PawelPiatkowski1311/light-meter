@@ -84,66 +84,45 @@ uint8_t t_USART_kbhit(){
          return 1;
      }
 } // USART_kbhit
-/*
-int16_t t_USART_getchar(){
-     int16_t tmp;
-     if(USART_Rx_Empty != USART_Rx_Busy){
-         tmp = USART_RxBuf[USART_Rx_Empty];
-         USART_Rx_Empty++;
-         if(USART_Rx_Empty >= USART_RXBUF_LEN) USART_Rx_Empty = 0;
-         return tmp;
-     } else return -1;
-} // USART_getchar
-*/
-/*
-uint8_t t_USART_getline(char *buf){
-     static uint8_t bf[128];
-     static uint8_t b_idx = 0;
-     int i;
-     uint8_t ret;
-     while(!t_USART_kbhit());
-     bf[b_idx] = t_USART_getchar();
-     if(bf[b_idx] == 0x0A){ // LF
-         if((bf[b_idx-1] == 0x0D) || (bf[b_idx] == 13)){
-             bf[b_idx] = 0;
-             for(i = 0; i < b_idx; i++)
-                 buf[i] = bf[i]; // przepisz do bufora
-             ret = b_idx;
-             b_idx = 0;
-             return ret; // odebrano linię
-         } else { // jeśli tekst dłuższy to zawijamy - trudno
-             b_idx++;
-             if(b_idx >= 128) b_idx = 0;
-         }
-     }
-     return 0;
-} // USART_getline
-*/
+
+static void USART_TxEnqueue(const uint8_t *buf, uint16_t len)
+{
+    __IO int idx = USART_Tx_Empty;
+    uint8_t was_idle = (USART_Tx_Empty == USART_Tx_Busy);
+
+    for (uint16_t i = 0; i < len; i++) {
+        USART_TxBuf[idx++] = buf[i];
+        if (idx >= USART_TXBUF_LEN) idx = 0;
+    }
+
+    __disable_irq();
+    USART_Tx_Empty = idx;
+    if (was_idle && (LL_USART_IsActiveFlag_TXE(USART2) == SET)) {
+        uint8_t tmp = USART_TxBuf[USART_Tx_Busy];
+        USART_Tx_Busy++;
+        if (USART_Tx_Busy >= USART_TXBUF_LEN) USART_Tx_Busy = 0;
+        HAL_UART_Transmit_IT(&huart2, &tmp, 1);
+    }
+    __enable_irq();
+}
+
 
 void USART_fsend(char *format, ...){
      char tmp_rs[128];
-     int i;
-     __IO int idx;
      va_list arglist;
      va_start(arglist, format);
      vsprintf(tmp_rs, format, arglist);
      va_end(arglist);
-     idx = USART_Tx_Empty;
-     for(i = 0; i < strlen(tmp_rs); i++){
-         USART_TxBuf[idx++] = tmp_rs[i];
-         if(idx >= USART_TXBUF_LEN) idx = 0;
-     }
-     __disable_irq();
-     if((USART_Tx_Empty == USART_Tx_Busy) && (LL_USART_IsActiveFlag_TXE(USART2) == SET)){ // sprawdzić dodatkowo zajętość bufora nadajnika
-         uint8_t tmp = USART_TxBuf[USART_Tx_Busy];
-         USART_Tx_Busy++;
-         if(USART_Tx_Busy >= USART_TXBUF_LEN) USART_Tx_Busy = 0;
-         HAL_UART_Transmit_IT(&huart2, &tmp, 1);
-     } else {
-         USART_Tx_Empty = idx;
-     }
-     __enable_irq();
+     USART_TxEnqueue((const uint8_t *)tmp_rs, (uint16_t)strlen(tmp_rs));
 } // fsend
+
+void USART_SendBuffer(const uint8_t *buf, uint16_t len)
+{
+    if (buf == NULL || len == 0) {
+        return;
+    }
+    USART_TxEnqueue(buf, len);
+}
 
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart){
      if(huart == &huart2){
@@ -156,17 +135,7 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart){
      }
 }
 
-// RX calback (wywolany przy odbiorze znaku)
-/*
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart){
-     if(huart == &huart2){
-         if(++USART_Rx_Empty >= USART_RXBUF_LEN) USART_Rx_Empty = 0;
-         HAL_UART_Receive_IT(&huart2, &USART_RxBuf[USART_Rx_Empty], 1);
-     }
-}
-*/
-// Globalny bufor
-//#define USART_RXBUF_LEN 32
+
 uint8_t USART_RxBuf[USART_RXBUF_LEN];
 volatile uint16_t USART_Rx_Head = 0; // miejsce do zapisu
 volatile uint16_t USART_Rx_Tail = 0; // miejsce do odczytu
@@ -234,9 +203,7 @@ int main(void)
   /* USER CODE END 2 */
 
   /* Init scheduler */
-  osKernelInitialize();
-
-  /* Call init function for freertos objects (in cmsis_os2.c) */
+  osKernelInitialize();  /* Call init function for freertos objects (in cmsis_os2.c) */
   MX_FREERTOS_Init();
 
   /* Start scheduler */
@@ -319,8 +286,7 @@ void Error_Handler(void)
   }
   /* USER CODE END Error_Handler_Debug */
 }
-
-#ifdef  USE_FULL_ASSERT
+#ifdef USE_FULL_ASSERT
 /**
   * @brief  Reports the name of the source file and the source line number
   *         where the assert_param error has occurred.

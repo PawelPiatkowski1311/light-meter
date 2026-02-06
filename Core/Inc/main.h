@@ -53,6 +53,8 @@ extern "C" {
 void Error_Handler(void);
 
 /* USER CODE BEGIN EFP */
+void USART_SendBuffer(const uint8_t *buf, uint16_t len);
+void USART_fsend(char *format, ...);
 
 /* USER CODE END EFP */
 
