@@ -11,15 +11,11 @@
 
 #include "lux_service.h"
 #include "lux_buffer.h"
-#include "stm32f3xx_hal.h"
 #include "protocol.h"
 #include "crc.h"
 
 /* Bufor danych zdefiniowany globalnie */
 extern LuxBuffer_t luxBuffer;
-
-/* UART */
-extern UART_HandleTypeDef huart2;
 
 void LuxService_ReturnLastN(uint16_t count, uint8_t sender)
 {
@@ -39,7 +35,10 @@ void LuxService_ReturnLastN(uint16_t count, uint8_t sender)
     /* Indeks pierwszego wpisu (od najstarszego) */
     uint16_t start = available - count;
 
-    /* Wypisywanie kolejnych wpisów */
+    /* Każdą próbkę zwracamy jako osobną ramkę DATA.
+     * Odbiorca może dzięki temu przetwarzać wyniki strumieniowo, bez buforowania
+     * całej odpowiedzi po stronie urządzenia.
+     */
     for (uint16_t i = 0; i < count; i++)
     {
         uint16_t lux_x10;
@@ -58,6 +57,9 @@ void Print_Frame(uint16_t lux_x10, uint8_t sender) {
     uint16_t idx = 0;
     int payload_len = 0;
 
+    /* Pole LEN ma obecnie jedną cyfrę ASCII, więc payload nie może przekroczyć 9 znaków.
+     * Jeśli format "DATA%u" przekroczy limit, ramka nie jest wysyłana.
+     */
     payload_len = snprintf(payload, sizeof(payload), "DATA%u", (unsigned int)lux_x10);
     if (payload_len <= 0 || payload_len > 9) {
         return;
@@ -79,8 +81,7 @@ void Print_Frame(uint16_t lux_x10, uint8_t sender) {
         tx_buf[idx++] = (uint8_t)('0' + (crc % 10));
     }
 
-    HAL_UART_Transmit(&huart2, tx_buf, idx, HAL_MAX_DELAY);
-    //USART_SendBuffer(tx_buf, idx);
+    USART_SendBuffer(tx_buf, idx);
     return;
 }
 

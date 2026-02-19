@@ -4,8 +4,6 @@
  *  Created on: Jan 7, 2026
  *      Author: pawel
  */
-#include "stm32f3xx_hal.h"
-
 #include "main.h"
 #include "frame_handler.h"
 #include "lux_service.h"
@@ -19,9 +17,6 @@
 
 /* Bufor globalny z pomiarami */
 extern LuxBuffer_t luxBuffer;
-
-/* UART do odpowiedzi */
-extern UART_HandleTypeDef huart2;
 
 extern uint32_t frequency;
 
@@ -42,12 +37,17 @@ void Frame_Handle(const Frame_t *frame) // koordynator
 
 void Frame_Validation(const Frame_t *frame)
 {
+    /* Kończymy obsługę natychmiast po wykryciu błędu integralności lub adresowania.
+     * Dzięki temu nie wykonujemy komendy dla ramki niepoprawnej.
+     */
 	if (frame->status != FRAME_OK) {
     	Send_Error(frame, frame->status);
+    	return;
 	}
 
 	if (frame->receiver != DEVICE) {
     	Send_Error(frame, FRAME_ERR_ADD);
+    	return;
 	}
 
 	FrameHandler_Process(frame);
@@ -60,7 +60,11 @@ void Send_Error(const Frame_t *frame, frame_status_t error_code)
     uint16_t idx = 0;
     const uint8_t payload_len = 2;
 
-    /* === SKLADANIE RAMKI === */
+    /* Budowa ramki błędu:
+     * payload ma postać "Nx", gdzie:
+     * - 'N' oznacza NACK,
+     * - 'x' to jednocyfrowy kod błędu zgodny z frame_status_t.
+     */
 
     tx_buf[idx++] = ':';             // znak startu
     tx_buf[idx++] = DEVICE;          // kod urzadzenia nadawcy
@@ -86,7 +90,7 @@ void Send_Response(const Frame_t *frame) {
     uint16_t idx = 0;
     const uint8_t payload_len = 1;
 
-    /* === SKLADANIE RAMKI === */
+    /* Budowa ramki potwierdzenia (ACK) dla poprawnie obsłużonej komendy. */
 
     tx_buf[idx++] = ':';             // znak startu
     tx_buf[idx++] = DEVICE;          // kod urzadzenia nadawcy
@@ -179,7 +183,9 @@ void FrameHandler_Process(const Frame_t *frame)
         	Send_Error(frame, FRAME_ERR_TIM);
         	return;
         }
-        // ustawienie globalnej zmiennej z freertos.c
+        /* Aktualizacja okresu próbkowania (ms) dla maszyny sensora.
+         * Zmiana jest globalna i zaczyna obowiązywać od kolejnego cyklu pomiarowego.
+         */
         extern uint32_t frequency;
         frequency = ms;
 

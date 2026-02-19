@@ -20,7 +20,8 @@ typedef enum {
     FRAME_ERR_CRC,	// błędne crc
 	FRAME_ERR_ADD,	// adresat nie istnieje
 	FRAME_ERR_CMD,	// komenda nie istnieje
-	FRAME_ERR_TIM	// zbyt krótki interwał
+	FRAME_ERR_TIM,	// zbyt krótki interwał
+    FRAME_ERR_ESC   // błędna sekwencja escape
 } frame_status_t;
 
 typedef struct {

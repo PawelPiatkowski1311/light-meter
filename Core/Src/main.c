@@ -18,153 +18,608 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "cmsis_os.h"
 #include "i2c.h"
 #include "usart.h"
 #include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include <string.h>
-#include <stdio.h>
 #include <stdarg.h>
-#include "stm32f3xx_ll_usart.h"
+#include <stdio.h>
+#include <string.h>
+
+#include "bh1750.h"
+#include "frame.h"
+#include "frame_handler.h"
 #include "lux_buffer.h"
-
-
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+typedef enum {
+    FSM_WAIT_START = 1,
+    FSM_WAIT_SENDER,
+    FSM_WAIT_RECEIVER,
+    FSM_WAIT_LEN,
+    FSM_WAIT_DATA,
+    FSM_WAIT_CRC,
+} FSM_State;
 
+typedef enum {
+    SENSOR_BOOT_DELAY = 0,
+    SENSOR_SEND_POWER_ON,
+    SENSOR_WAIT_POWER_ON,
+    SENSOR_SEND_RESET,
+    SENSOR_WAIT_RESET,
+    SENSOR_SEND_CONT_H_RES,
+    SENSOR_WAIT_CONT_H_RES,
+    SENSOR_FIRST_MEAS_DELAY,
+    SENSOR_READ_REQUEST,
+    SENSOR_WAIT_READ,
+} SensorState;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define USART_TXBUF_LEN 1512u
+#define USART_RXBUF_LEN 128u
 
+#define I2C_EVT_TX_DONE (1u << 0)
+#define I2C_EVT_RX_DONE (1u << 1)
+#define I2C_EVT_ERR     (1u << 2)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
+/* Bufory pierścieniowe UART.
+ * ISR zapisuje/odczytuje pojedyncze bajty, a kod główny dokłada dane do TX.
+ * Dzięki temu transmisja jest nieblokująca i odporna na krótkie skoki obciążenia.
+ */
+static uint8_t usart_tx_buf[USART_TXBUF_LEN];
+static uint8_t usart_rx_buf[USART_RXBUF_LEN];
 
+static volatile uint16_t usart_tx_head = 0;
+static volatile uint16_t usart_tx_tail = 0;
+static volatile uint16_t usart_rx_head = 0;
+static volatile uint16_t usart_rx_tail = 0;
+static volatile uint32_t usart_rx_overflow = 0;
+
+static uint8_t uart_tx_byte_in_flight = 0;
+static uint8_t uart_rx_byte_in_flight = 0;
+
+static volatile uint32_t i2c_events = 0;
+static uint8_t bh1750_rx_buf[2];
+
+/* Dane współdzielone przez moduły aplikacyjne:
+ * - luxBuffer: historia pomiarów (bufor cykliczny),
+ * - frequency: okres próbkowania w milisekundach, modyfikowany komendą SETTM.
+ */
+LuxBuffer_t luxBuffer;
+uint32_t frequency = 1000;
+
+static SensorState sensor_state = SENSOR_BOOT_DELAY;
+static uint32_t sensor_deadline_ms = 0;
+
+static FSM_State fsm_state = FSM_WAIT_START;
+static Frame_t frame;
+static uint8_t data_index = 0;
+static uint8_t crc_index = 0;
+static uint8_t crc_ascii[3];
+static uint8_t computed_crc = 0;
+static volatile uint8_t frame_ready = 0;
+static uint8_t escape_pending = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
-void MX_FREERTOS_Init(void);
 /* USER CODE BEGIN PFP */
+static void USART_StartTxIfIdle(void);
+static void USART_TxEnqueue(const uint8_t *buf, uint16_t len);
+static uint8_t USART_RxPushFromISR(uint8_t byte);
+static uint8_t USART_RxPopFromISR(uint8_t *byte);
 
+static void FSM_Reset(void);
+static void FSM_ProcessByte(uint8_t rx);
+
+static void Sensor_Init(void);
+static void Sensor_Process(void);
+
+static uint8_t TimeReached(uint32_t now, uint32_t deadline);
+static uint32_t I2C_FetchEvents(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-#define USART_TXBUF_LEN 1512
-#define USART_RXBUF_LEN 128
-uint8_t USART_TxBuf[USART_TXBUF_LEN];
-uint8_t USART_RxBuf[USART_RXBUF_LEN];
+static uint8_t TimeReached(uint32_t now, uint32_t deadline)
+{
+    return (int32_t)(now - deadline) >= 0;
+}
 
-/* Globalny bufor pomiarów */
-LuxBuffer_t luxBuffer;
+static uint32_t I2C_FetchEvents(void)
+{
+    uint32_t events;
 
-__IO int USART_Tx_Empty = 0;
-__IO int USART_Tx_Busy  = 0;
-__IO int USART_Rx_Empty = 0;
-__IO int USART_Rx_Busy  = 0;
+    /* Atomowe pobranie i wyczyszczenie flag zdarzeń z ISR.
+     * Bez sekcji krytycznej moglibyśmy zgubić lub nadpisać bity ustawione
+     * równolegle przez callbacki I2C/DMA.
+     */
+    __disable_irq();
+    events = i2c_events;
+    i2c_events = 0;
+    __enable_irq();
 
-uint8_t t_USART_kbhit(){
-	if(USART_Rx_Empty == USART_Rx_Busy){
-         return 0;
-     }else{
-         return 1;
-     }
-} // USART_kbhit
+    return events;
+}
+
+static void USART_StartTxIfIdle(void)
+{
+    uint8_t start_tx = 0;
+    uint8_t byte_to_send = 0;
+
+    /* Sekcja krytyczna chroni indeksy bufora TX przed wyścigiem z ISR UART.
+     * Dzięki temu nie dojdzie do uszkodzenia kolejki podczas równoległych zmian.
+     */
+    __disable_irq();
+    if ((usart_tx_head != usart_tx_tail) && (huart2.gState == HAL_UART_STATE_READY)) {
+        byte_to_send = usart_tx_buf[usart_tx_tail];
+        usart_tx_tail = (uint16_t)((usart_tx_tail + 1u) % USART_TXBUF_LEN);
+        start_tx = 1;
+    }
+    __enable_irq();
+
+    if (start_tx) {
+        uart_tx_byte_in_flight = byte_to_send;
+        /* Gdy HAL odrzuci start transmisji, cofamy ogon kolejki TX,
+         * aby nie utracić bajtu zdjętego wcześniej z bufora.
+         */
+        if (HAL_UART_Transmit_IT(&huart2, &uart_tx_byte_in_flight, 1u) != HAL_OK) {
+            __disable_irq();
+            usart_tx_tail = (uint16_t)((usart_tx_tail == 0u) ? (USART_TXBUF_LEN - 1u) : (usart_tx_tail - 1u));
+            __enable_irq();
+        }
+    }
+}
 
 static void USART_TxEnqueue(const uint8_t *buf, uint16_t len)
 {
-    __IO int idx = USART_Tx_Empty;
-    uint8_t was_idle = (USART_Tx_Empty == USART_Tx_Busy);
+    uint16_t i;
 
-    for (uint16_t i = 0; i < len; i++) {
-        USART_TxBuf[idx++] = buf[i];
-        if (idx >= USART_TXBUF_LEN) idx = 0;
+    if ((buf == NULL) || (len == 0u)) {
+        return;
     }
 
+    /*
+     * Unikamy czekania aktywnego i blokowania głównej pętli.
+     */
     __disable_irq();
-    USART_Tx_Empty = idx;
-    if (was_idle && (LL_USART_IsActiveFlag_TXE(USART2) == SET)) {
-        uint8_t tmp = USART_TxBuf[USART_Tx_Busy];
-        USART_Tx_Busy++;
-        if (USART_Tx_Busy >= USART_TXBUF_LEN) USART_Tx_Busy = 0;
-        HAL_UART_Transmit_IT(&huart2, &tmp, 1);
+    for (i = 0u; i < len; i++) {
+        uint16_t next = (uint16_t)((usart_tx_head + 1u) % USART_TXBUF_LEN);
+        if (next == usart_tx_tail) {
+            break;
+        }
+        usart_tx_buf[usart_tx_head] = buf[i];
+        usart_tx_head = next;
     }
     __enable_irq();
+
+    USART_StartTxIfIdle();
 }
-
-
-void USART_fsend(char *format, ...){
-     char tmp_rs[128];
-     va_list arglist;
-     va_start(arglist, format);
-     vsprintf(tmp_rs, format, arglist);
-     va_end(arglist);
-     USART_TxEnqueue((const uint8_t *)tmp_rs, (uint16_t)strlen(tmp_rs));
-} // fsend
 
 void USART_SendBuffer(const uint8_t *buf, uint16_t len)
 {
-    if (buf == NULL || len == 0) {
-        return;
-    }
     USART_TxEnqueue(buf, len);
 }
 
-void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart){
-     if(huart == &huart2){
-         if(USART_Tx_Empty != USART_Tx_Busy){
-             uint8_t tmp = USART_TxBuf[USART_Tx_Busy];
-             USART_Tx_Busy++;
-             if(USART_Tx_Busy >= USART_TXBUF_LEN) USART_Tx_Busy = 0;
-             HAL_UART_Transmit_IT(&huart2, &tmp, 1);
-         }
-     }
+void USART_fsend(char *format, ...)
+{
+    char tmp[128];
+    int n;
+    va_list arglist;
+
+    va_start(arglist, format);
+    n = vsnprintf(tmp, sizeof(tmp), format, arglist);
+    va_end(arglist);
+
+    if (n <= 0) {
+        return;
+    }
+
+    if ((size_t)n >= sizeof(tmp)) {
+        n = (int)(sizeof(tmp) - 1u);
+    }
+
+    USART_TxEnqueue((const uint8_t *)tmp, (uint16_t)n);
 }
 
-
-uint8_t USART_RxBuf[USART_RXBUF_LEN];
-volatile uint16_t USART_Rx_Head = 0; // miejsce do zapisu
-volatile uint16_t USART_Rx_Tail = 0; // miejsce do odczytu
-
-// Callback HAL UART
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+static uint8_t USART_RxPushFromISR(uint8_t byte)
 {
-    if (huart->Instance == USART2)
-    {
-        // restart odbioru na bieżący indeks
-        HAL_UART_Receive_IT(&huart2, &USART_RxBuf[USART_Rx_Head], 1);
+    uint16_t next = (uint16_t)((usart_rx_head + 1u) % USART_RXBUF_LEN);
+    if (next == usart_rx_tail) {
+        usart_rx_overflow++;
+        return 0u;
+    }
 
-        // dopiero po wywołaniu Receive_IT zwiększamy indeks
-        uint16_t next = USART_Rx_Head + 1;
-        if(next >= USART_RXBUF_LEN) next = 0;
-        USART_Rx_Head = next;
+    usart_rx_buf[usart_rx_head] = byte;
+    usart_rx_head = next;
+    return 1u;
+}
+
+static uint8_t USART_RxPopFromISR(uint8_t *byte)
+{
+    if (usart_rx_tail == usart_rx_head) {
+        return 0u;
+    }
+
+    *byte = usart_rx_buf[usart_rx_tail];
+    usart_rx_tail = (uint16_t)((usart_rx_tail + 1u) % USART_RXBUF_LEN);
+    return 1u;
+}
+
+static void FSM_Reset(void)
+{
+    fsm_state = FSM_WAIT_START;
+    data_index = 0;
+    crc_index = 0;
+    computed_crc = 0;
+    escape_pending = 0;
+}
+
+static void FSM_ProcessByte(uint8_t rx)
+{
+    /* Parser ramki działający bajt-po-bajcie.
+     * Obsługa escape:
+     * - '/:' oznacza znak ':',
+     * - '//' oznacza znak '/'.
+     * Escape dopuszczamy tylko tam, gdzie ma sens semantyczny (sender/receiver/data).
+     * W polach LEN i CRC sekwencje escape są błędem składni ramki.
+     */
+    switch (fsm_state) {
+    case FSM_WAIT_START:
+        if (rx == ':') {
+            computed_crc = rx;
+            data_index = 0;
+            crc_index = 0;
+            frame.status = FRAME_NONE;
+            escape_pending = 0;
+            fsm_state = FSM_WAIT_SENDER;
+        }
+        break;
+
+    case FSM_WAIT_SENDER:
+        if (escape_pending) {
+            if ((rx != ':') && (rx != '/')) {
+                frame.status = FRAME_ERR_ESC;
+                FSM_Reset();
+                break;
+            }
+            escape_pending = 0;
+        } else {
+            if (rx == '/') {
+                escape_pending = 1;
+                break;
+            }
+            if (rx == ':') {
+                frame.status = FRAME_ERR_ESC;
+                FSM_Reset();
+                break;
+            }
+        }
+        frame.sender = rx;
+        computed_crc = (uint8_t)(computed_crc + rx);
+        fsm_state = FSM_WAIT_RECEIVER;
+        break;
+
+    case FSM_WAIT_RECEIVER:
+        if (escape_pending) {
+            if ((rx != ':') && (rx != '/')) {
+                frame.status = FRAME_ERR_ESC;
+                frame_ready = 1;
+                FSM_Reset();
+                break;
+            }
+            escape_pending = 0;
+        } else {
+            if (rx == '/') {
+                escape_pending = 1;
+                break;
+            }
+            if (rx == ':') {
+                frame.status = FRAME_ERR_ESC;
+                frame_ready = 1;
+                FSM_Reset();
+                break;
+            }
+        }
+
+        frame.receiver = rx;
+        computed_crc = (uint8_t)(computed_crc + rx);
+        fsm_state = FSM_WAIT_LEN;
+        break;
+
+    case FSM_WAIT_LEN:
+        if (escape_pending || (rx == '/') || (rx == ':')) {
+            frame.status = FRAME_ERR_ESC;
+            frame_ready = 1;
+            FSM_Reset();
+            break;
+        }
+
+        if ((rx < '0') || (rx > '9')) {
+            frame.status = FRAME_ERR_LEN;
+            frame_ready = 1;
+            FSM_Reset();
+            break;
+        }
+
+        frame.length = (uint8_t)(rx - '0');
+        computed_crc = (uint8_t)(computed_crc + rx);
+        data_index = 0;
+
+        if (frame.length > MAX_DATA_LEN) {
+            frame.status = FRAME_ERR_LEN;
+            frame_ready = 1;
+            FSM_Reset();
+            break;
+        }
+
+        fsm_state = (frame.length > 0u) ? FSM_WAIT_DATA : FSM_WAIT_CRC;
+        break;
+
+    case FSM_WAIT_DATA:
+        if (escape_pending) {
+            if ((rx != ':') && (rx != '/')) {
+                frame.status = FRAME_ERR_ESC;
+                frame_ready = 1;
+                FSM_Reset();
+                break;
+            }
+            escape_pending = 0;
+        } else {
+            if (rx == '/') {
+                escape_pending = 1;
+                break;
+            }
+            if (rx == ':') {
+                frame.status = FRAME_ERR_ESC;
+                frame_ready = 1;
+                FSM_Reset();
+                break;
+            }
+        }
+
+        frame.data[data_index++] = rx;
+        computed_crc = (uint8_t)(computed_crc + rx);
+        if (data_index >= frame.length) {
+            fsm_state = FSM_WAIT_CRC;
+        }
+        break;
+
+    case FSM_WAIT_CRC:
+        if (escape_pending || (rx == '/') || (rx == ':')) {
+            frame.status = FRAME_ERR_ESC;
+            frame_ready = 1;
+            FSM_Reset();
+            break;
+        }
+
+        if ((rx < '0') || (rx > '9')) {
+            frame.status = FRAME_ERR_CRC;
+            frame_ready = 1;
+            FSM_Reset();
+            break;
+        }
+
+        crc_ascii[crc_index++] = rx;
+        if (crc_index < 3u) {
+            break;
+        }
+
+        frame.crc = (uint8_t)((crc_ascii[0] - '0') * 100u +
+                              (crc_ascii[1] - '0') * 10u +
+                              (crc_ascii[2] - '0'));
+
+        if (frame.crc == computed_crc) {
+            frame.status = FRAME_OK;
+        } else {
+            frame.status = FRAME_ERR_CRC;
+        }
+
+        frame_ready = 1;
+        FSM_Reset();
+        break;
+
+    default:
+        FSM_Reset();
+        break;
     }
 }
 
-// Pobranie znaku z bufora
-int t_USART_getchar(void)
+static void Sensor_Init(void)
 {
-    if (USART_Rx_Tail == USART_Rx_Head) return -1; // brak danych
-    int ch = USART_RxBuf[USART_Rx_Tail++];
-    if(USART_Rx_Tail >= USART_RXBUF_LEN) USART_Rx_Tail = 0;
-    return ch;
+    /* Czas ochronny po starcie zasilania.
+     * BH1750 wymaga krótkiej stabilizacji zanim przyjmie pierwsze komendy.
+     */
+    sensor_state = SENSOR_BOOT_DELAY;
+    sensor_deadline_ms = HAL_GetTick() + 200u;
 }
 
+static void Sensor_Process(void)
+{
+    const uint32_t now = HAL_GetTick();
+    const uint32_t events = I2C_FetchEvents();
 
+    /* Nieblokująca maszyna stanów czujnika BH1750.
+     * Przejścia stanu wynikają wyłącznie z:
+     * - zdarzeń DMA/I2C zgłaszanych przez przerwania,
+     * - timeoutów liczonych na podstawie HAL_GetTick().
+     * Brak HAL_Delay i brak oczekiwania aktywnego.
+     */
+    switch (sensor_state) {
+    case SENSOR_BOOT_DELAY:
+        if (TimeReached(now, sensor_deadline_ms)) {
+            sensor_state = SENSOR_SEND_POWER_ON;
+        }
+        break;
+
+    case SENSOR_SEND_POWER_ON:
+        if (BH1750_SendCommand_DMA(&hi2c1, BH1750_POWER_ON) == HAL_OK) {
+            sensor_state = SENSOR_WAIT_POWER_ON;
+        } else {
+            sensor_deadline_ms = now + 10u;
+            sensor_state = SENSOR_BOOT_DELAY;
+        }
+        break;
+
+    case SENSOR_WAIT_POWER_ON:
+        if ((events & I2C_EVT_ERR) != 0u) {
+            sensor_state = SENSOR_SEND_POWER_ON;
+        } else if ((events & I2C_EVT_TX_DONE) != 0u) {
+            sensor_deadline_ms = now + 10u;
+            sensor_state = SENSOR_SEND_RESET;
+        }
+        break;
+
+    case SENSOR_SEND_RESET:
+        if (!TimeReached(now, sensor_deadline_ms)) {
+            break;
+        }
+
+        if (BH1750_SendCommand_DMA(&hi2c1, BH1750_RESET) == HAL_OK) {
+            sensor_state = SENSOR_WAIT_RESET;
+        } else {
+            sensor_deadline_ms = now + 10u;
+        }
+        break;
+
+    case SENSOR_WAIT_RESET:
+        if ((events & I2C_EVT_ERR) != 0u) {
+            sensor_state = SENSOR_SEND_RESET;
+        } else if ((events & I2C_EVT_TX_DONE) != 0u) {
+            sensor_deadline_ms = now + 10u;
+            sensor_state = SENSOR_SEND_CONT_H_RES;
+        }
+        break;
+
+    case SENSOR_SEND_CONT_H_RES:
+        if (!TimeReached(now, sensor_deadline_ms)) {
+            break;
+        }
+
+        if (BH1750_SendCommand_DMA(&hi2c1, BH1750_CONT_H_RES) == HAL_OK) {
+            sensor_state = SENSOR_WAIT_CONT_H_RES;
+        } else {
+            sensor_deadline_ms = now + 10u;
+        }
+        break;
+
+    case SENSOR_WAIT_CONT_H_RES:
+        if ((events & I2C_EVT_ERR) != 0u) {
+            sensor_state = SENSOR_SEND_CONT_H_RES;
+        } else if ((events & I2C_EVT_TX_DONE) != 0u) {
+            sensor_deadline_ms = now + 180u;
+            sensor_state = SENSOR_FIRST_MEAS_DELAY;
+        }
+        break;
+
+    case SENSOR_FIRST_MEAS_DELAY:
+        if (TimeReached(now, sensor_deadline_ms)) {
+            sensor_state = SENSOR_READ_REQUEST;
+        }
+        break;
+
+    case SENSOR_READ_REQUEST:
+        if (BH1750_ReadRaw_DMA(&hi2c1, bh1750_rx_buf, sizeof(bh1750_rx_buf)) == HAL_OK) {
+            sensor_state = SENSOR_WAIT_READ;
+        } else {
+            sensor_deadline_ms = now + 10u;
+            sensor_state = SENSOR_FIRST_MEAS_DELAY;
+        }
+        break;
+
+    case SENSOR_WAIT_READ:
+        if ((events & I2C_EVT_ERR) != 0u) {
+            sensor_deadline_ms = now + 10u;
+            sensor_state = SENSOR_FIRST_MEAS_DELAY;
+        } else if ((events & I2C_EVT_RX_DONE) != 0u) {
+            float lux;
+            uint16_t lux_x10;
+
+            BH1750_ConvertLux(bh1750_rx_buf, &lux);
+            lux_x10 = (uint16_t)(lux * 10.0f);
+            LuxBuffer_Push(&luxBuffer, lux_x10);
+
+            sensor_deadline_ms = now + frequency;
+            sensor_state = SENSOR_FIRST_MEAS_DELAY;
+        }
+        break;
+
+    default:
+        sensor_state = SENSOR_SEND_POWER_ON;
+        break;
+    }
+}
+
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART2) {
+        USART_StartTxIfIdle();
+    }
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART2) {
+        uint8_t byte;
+
+        /* Bajt z UART trafia najpierw do bufora RX.
+         * Pozwala to buforować krótkie bursty oraz ogranicza ryzyko utraty danych.
+         */
+        (void)USART_RxPushFromISR(uart_rx_byte_in_flight);
+
+        /* FSM nadal uruchamiamy wyłącznie w ISR RX,
+         * ale wejściem jest teraz kolejka RX zamiast pojedynczej zmiennej.
+         */
+        while (USART_RxPopFromISR(&byte) != 0u) {
+            FSM_ProcessByte(byte);
+        }
+
+        (void)HAL_UART_Receive_IT(&huart2, &uart_rx_byte_in_flight, 1u);
+    }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART2) {
+        __HAL_UART_CLEAR_OREFLAG(&huart2);
+        (void)HAL_UART_Receive_IT(&huart2, &uart_rx_byte_in_flight, 1u);
+    }
+}
+
+void HAL_I2C_MasterTxCpltCallback(I2C_HandleTypeDef *hi2c)
+{
+    if (hi2c->Instance == I2C1) {
+        i2c_events |= I2C_EVT_TX_DONE;
+    }
+}
+
+void HAL_I2C_MasterRxCpltCallback(I2C_HandleTypeDef *hi2c)
+{
+    if (hi2c->Instance == I2C1) {
+        i2c_events |= I2C_EVT_RX_DONE;
+    }
+}
+
+void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c)
+{
+    if (hi2c->Instance == I2C1) {
+        i2c_events |= I2C_EVT_ERR;
+    }
+}
 /* USER CODE END 0 */
 
 /**
@@ -173,9 +628,7 @@ int t_USART_getchar(void)
   */
 int main(void)
 {
-
   /* USER CODE BEGIN 1 */
-
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -184,14 +637,12 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
-
   /* USER CODE END Init */
 
   /* Configure the system clock */
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
-
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
@@ -199,21 +650,33 @@ int main(void)
   MX_USART2_UART_Init();
   MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
+  LuxBuffer_Init(&luxBuffer);
+  Sensor_Init();
 
+  (void)HAL_UART_Receive_IT(&huart2, &uart_rx_byte_in_flight, 1u);
+
+  {
+      const char msg[] = "START USART2 IRQ\r\n";
+      USART_SendBuffer((const uint8_t *)msg, (uint16_t)(sizeof(msg) - 1u));
+  }
   /* USER CODE END 2 */
-
-  /* Init scheduler */
-  osKernelInitialize();  /* Call init function for freertos objects (in cmsis_os2.c) */
-  MX_FREERTOS_Init();
-
-  /* Start scheduler */
-  osKernelStart();
-
-  /* We should never get here as control is now taken by the scheduler */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  while (1) {
+  while (1)
+  {
+    if (frame_ready != 0u) {
+        Frame_t local_frame;
+
+        __disable_irq();
+        frame_ready = 0u;
+        local_frame = frame;
+        __enable_irq();
+
+        Frame_Handle(&local_frame);
+    }
+
+    Sensor_Process();
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -269,7 +732,6 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
-
 /* USER CODE END 4 */
 
 /**
